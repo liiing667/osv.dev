@@ -16,6 +16,10 @@ import (
 // GroupAffectedRanges groups ranges that share the same introduced value, type, and repo.
 // This is because having multiple ranges with the same introduced value would act like an
 // OR condition, rather than AND.
+// Ranges whose mutually exclusive terminal events conflict (e.g. one ends with "fixed"
+// and another with "last_affected" for the same introduced value) are kept as separate
+// ranges instead of being merged, since mixing those boundary kinds in a single OSV
+// range is semantically invalid.
 // This function modifies in-place
 func GroupAffectedRanges(affected []*osvschema.Affected) {
 	for _, aff := range affected {
@@ -36,16 +40,79 @@ func GroupAffectedRanges(affected []*osvschema.Affected) {
 	}
 }
 
+// rangeTerminatorKind classifies the mutually exclusive terminal boundary of a range.
+// fixed and last_affected are alternative ways to close an affected segment and must
+// not be mixed within a single OSV range for the same introduced value.
+type rangeTerminatorKind int
+
+const (
+	rangeTerminatorOpen rangeTerminatorKind = iota
+	rangeTerminatorFixed
+	rangeTerminatorLastAffected
+	rangeTerminatorMixed
+)
+
+// terminatorKindOf inspects a range's events and reports which terminal boundary kind
+// it uses. A range containing both fixed and last_affected events is reported as mixed.
+func terminatorKindOf(r *osvschema.Range) rangeTerminatorKind {
+	var kind rangeTerminatorKind
+	for _, e := range r.GetEvents() {
+		switch {
+		case e.GetFixed() != "":
+			if kind != rangeTerminatorOpen && kind != rangeTerminatorFixed {
+				return rangeTerminatorMixed
+			}
+			kind = rangeTerminatorFixed
+		case e.GetLastAffected() != "":
+			if kind != rangeTerminatorOpen && kind != rangeTerminatorLastAffected {
+				return rangeTerminatorMixed
+			}
+			kind = rangeTerminatorLastAffected
+		}
+	}
+
+	return kind
+}
+
 func GroupRanges(ranges []models.RangeWithMetadata) []models.RangeWithMetadata {
-	// Key for grouping: Type + Repo + Introduced Value
+	// Key for the initial grouping: Type + Repo + Introduced Value.
 	type groupKey struct {
 		RangeType  osvschema.Range_Type
 		Repo       string
 		Introduced string
 	}
 
-	groups := make(map[groupKey]models.RangeWithMetadata)
+	// A subgroup collects the input ranges sharing the same grouping key and the
+	// same terminal boundary kind. Ranges in a subgroup can be safely merged into
+	// one OSV range; conflicting subgroups stay independent.
+	type subgroup struct {
+		kind   rangeTerminatorKind
+		ranges []models.RangeWithMetadata
+	}
+
+	groups := make(map[groupKey][]*subgroup)
 	var order []groupKey // To maintain deterministic order of first appearance
+
+	// assign places rwm into the matching subgroup for the key, creating it on first
+	// use. Open-ended ranges (no terminal event) are compatible with any boundary kind,
+	// so they join the first subgroup to preserve the historical merging behaviour.
+	assign := func(key groupKey, rwm models.RangeWithMetadata, kind rangeTerminatorKind) {
+		subgroups := groups[key]
+		if kind == rangeTerminatorOpen && len(subgroups) > 0 {
+			subgroups[0].ranges = append(subgroups[0].ranges, rwm)
+			return
+		}
+		for _, sg := range subgroups {
+			if sg.kind == kind {
+				sg.ranges = append(sg.ranges, rwm)
+				return
+			}
+		}
+		groups[key] = append(subgroups, &subgroup{
+			kind:   kind,
+			ranges: []models.RangeWithMetadata{rwm},
+		})
+	}
 
 	for _, rwm := range ranges {
 		r := rwm.Range
@@ -64,41 +131,63 @@ func GroupRanges(ranges []models.RangeWithMetadata) []models.RangeWithMetadata {
 		}
 
 		// If no introduced event is found, we use an empty string as the introduced value.
+		kind := terminatorKindOf(r)
 		key := groupKey{
 			RangeType:  r.GetType(),
 			Repo:       r.GetRepo(),
 			Introduced: introduced,
 		}
-
 		if _, exists := groups[key]; !exists {
-			// Initialize with a deep copy of the first range found for this group
-			// We need to be careful about DatabaseSpecific.
-			// We want to keep the "extracted_events" from this first range.
-			groups[key] = models.RangeWithMetadata{
-				Range: &osvschema.Range{
-					Type:             r.GetType(),
-					Repo:             r.GetRepo(),
-					Events:           []*osvschema.Event{},
-					DatabaseSpecific: r.GetDatabaseSpecific(), // Start with this one's DS
-				},
-				Metadata: rwm.Metadata,
-			}
 			order = append(order, key)
-		} else {
-			// Merge DatabaseSpecific
-			mergeDatabaseSpecific(groups[key].Range, r.GetDatabaseSpecific())
 		}
-
-		// Add all events to the group. Deduplication happens later in cleanEvents.
-		groups[key].Range.Events = append(groups[key].Range.Events, r.GetEvents()...)
+		assign(key, rwm, kind)
 	}
 
 	// Reconstruct ranges from groups
 	newRanges := make([]models.RangeWithMetadata, 0, len(order))
 	for _, key := range order {
-		rwm := groups[key]
-		rwm.Range.Events = cleanEvents(rwm.Range.GetEvents())
-		newRanges = append(newRanges, rwm)
+		subgroups := groups[key]
+		hasFixed := false
+		hasLastAffected := false
+		for _, sg := range subgroups {
+			switch sg.kind {
+			case rangeTerminatorFixed:
+				hasFixed = true
+			case rangeTerminatorLastAffected:
+				hasLastAffected = true
+			case rangeTerminatorOpen, rangeTerminatorMixed:
+				// Open and single-range mixed boundaries do not by themselves establish
+				// a fixed/last_affected conflict between distinct subgroups.
+			}
+		}
+		if hasFixed && hasLastAffected {
+			logger.Warn("Conflicting fixed and last_affected boundary events for the same range; keeping them as independent ranges",
+				slog.Any("type", key.RangeType),
+				slog.String("repo", key.Repo),
+				slog.String("introduced", key.Introduced),
+			)
+		}
+
+		for _, sg := range subgroups {
+			merged := models.RangeWithMetadata{
+				Range: &osvschema.Range{
+					Type:             key.RangeType,
+					Repo:             key.Repo,
+					Events:           []*osvschema.Event{},
+					DatabaseSpecific: sg.ranges[0].Range.GetDatabaseSpecific(),
+				},
+				Metadata: sg.ranges[0].Metadata,
+			}
+			for _, rwm := range sg.ranges[1:] {
+				mergeDatabaseSpecific(merged.Range, rwm.Range.GetDatabaseSpecific())
+			}
+			for _, rwm := range sg.ranges {
+				// Add all events to the subgroup. Deduplication happens in cleanEvents.
+				merged.Range.Events = append(merged.Range.Events, rwm.Range.GetEvents()...)
+			}
+			merged.Range.Events = cleanEvents(merged.Range.GetEvents())
+			newRanges = append(newRanges, merged)
+		}
 	}
 
 	return newRanges
@@ -265,6 +354,79 @@ func cleanEvents(events []*osvschema.Event) []*osvschema.Event {
 	return finalEvents
 }
 
+// rangeIdentity identifies ranges that GroupRanges considers equivalent apart from
+// their terminal boundary kind: same type, repo and introduced value.
+type rangeIdentity struct {
+	rangeType  osvschema.Range_Type
+	repo       string
+	introduced string
+}
+
+func identityOf(r *osvschema.Range) rangeIdentity {
+	introduced := ""
+	for _, e := range r.GetEvents() {
+		if e.GetIntroduced() != "" {
+			introduced = e.GetIntroduced()
+		}
+	}
+
+	return rangeIdentity{
+		rangeType:  r.GetType(),
+		repo:       r.GetRepo(),
+		introduced: introduced,
+	}
+}
+
+// partitionMergeableRanges splits ranges into buckets that are safe to concatenate
+// into a single OSV range. Ranges sharing the same type, repo and introduced value
+// but carrying mutually exclusive terminal boundaries (fixed vs last_affected) are
+// placed in separate buckets, preserving the independent, auditable ranges produced
+// by GroupRanges. First-appearance order within and across buckets is preserved.
+func partitionMergeableRanges(ranges []models.RangeWithMetadata) [][]models.RangeWithMetadata {
+	var buckets [][]models.RangeWithMetadata
+	// kindBuckets maps each conflicting identity and terminator kind to its bucket.
+	// Ranges whose identity has no conflicting terminator kinds always join bucket 0,
+	// preserving the previous behaviour of merging every range for the same repository.
+	kindBuckets := make(map[rangeIdentity]map[rangeTerminatorKind]int)
+
+	for _, rwm := range ranges {
+		identity := identityOf(rwm.Range)
+		kind := terminatorKindOf(rwm.Range)
+		bucketIdx := 0
+
+		byKind, tracked := kindBuckets[identity]
+		if !tracked {
+			// First range for this type/repo/introduced combination. It joins the default
+			// bucket; only start tracking terminator-specific buckets once a boundary exists.
+			if kind == rangeTerminatorFixed || kind == rangeTerminatorLastAffected {
+				kindBuckets[identity] = map[rangeTerminatorKind]int{kind: 0}
+			}
+		} else if idx, exists := byKind[kind]; exists {
+			bucketIdx = idx
+		} else if kind == rangeTerminatorFixed || kind == rangeTerminatorLastAffected {
+			// Conflicting terminator kind for the same introduced value: this range must
+			// stay independent from the existing boundary.
+			bucketIdx = len(buckets)
+			buckets = append(buckets, nil)
+			byKind[kind] = bucketIdx
+		} else {
+			// Open and already-mixed boundaries without a dedicated bucket follow the
+			// first bucket assigned to this identity.
+			for _, idx := range byKind {
+				bucketIdx = idx
+				break
+			}
+		}
+
+		for len(buckets) <= bucketIdx {
+			buckets = append(buckets, nil)
+		}
+		buckets[bucketIdx] = append(buckets[bucketIdx], rwm)
+	}
+
+	return buckets
+}
+
 // MergeRangesAndCreateAffected combines resolved and unresolved ranges with commits to create an OSV Affected object.
 // It merges ranges for the same repository and adds commit events to the appropriate ranges at the end.
 //
@@ -347,33 +509,40 @@ func MergeRangesAndCreateAffected(
 				}
 			}
 
-			var mergedRange *osvschema.Range
 			var versions []string
 			for _, vrwm := range otherRanges {
-				vr := vrwm.Range
 				versions = append(versions, vrwm.Metadata.Versions...)
-				if mergedRange == nil {
-					mergedRange = vr
-				} else {
+			}
+			slices.Sort(versions)
+			versions = slices.Compact(versions)
+
+			// GroupRanges keeps mutually exclusive fixed/last_affected boundaries for the
+			// same introduced value in independent ranges. Preserve those partitions here so
+			// the ranges are not concatenated back into one semantically invalid OSV range.
+			for _, bucket := range partitionMergeableRanges(otherRanges) {
+				var mergedRange *osvschema.Range
+				for _, vrwm := range bucket {
+					if mergedRange == nil {
+						mergedRange = vrwm.Range
+						continue
+					}
 					var err error
-					mergedRange, err = MergeTwoRanges(mergedRange, vr)
+					mergedRange, err = MergeTwoRanges(mergedRange, vrwm.Range)
 					if err != nil {
 						metrics.AddNotef("Failed to merge ranges: %v", err)
 					}
 				}
-			}
-			for _, commit := range commits {
-				if commit.Repo == repo {
-					mergedRange = addCommitToRange(mergedRange, commit, metrics)
+				for _, commit := range commits {
+					if commit.Repo == repo {
+						mergedRange = addCommitToRange(mergedRange, commit, metrics)
+					}
 				}
-			}
-			if mergedRange != nil {
-				slices.Sort(versions)
-				versions = slices.Compact(versions)
-				newAffected = append(newAffected, &osvschema.Affected{
-					Ranges:   []*osvschema.Range{mergedRange},
-					Versions: versions,
-				})
+				if mergedRange != nil {
+					newAffected = append(newAffected, &osvschema.Affected{
+						Ranges:   []*osvschema.Range{mergedRange},
+						Versions: versions,
+					})
+				}
 			}
 		}
 	}
